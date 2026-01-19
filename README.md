@@ -8,7 +8,7 @@
   <a href="#performance">Performance</a> •
   <a href="#faq">FAQ</a>
 </p>
-
+my email:jasonuzi12@gmail.com
 ## Introduction
 
 **SEDAC** (Speculative Early-Exit Decoding with Adaptive Calibration) is a research toolkit designed to accelerate Large Language Model (LLM) inference without sacrificing generation quality.
