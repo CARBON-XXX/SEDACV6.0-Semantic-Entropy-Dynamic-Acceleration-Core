@@ -400,16 +400,7 @@ sedac_exits_total = 0
 
 ---
 
-## Citation
-
-```bibtex
-@software{sedac2024,
-  title={SEDAC: Semantic Entropy Dynamic Acceleration Core},
-  author={CARBON-XXX},
-  year={2024},
-  url={https://github.com/CARBON-XXX/Semantic-Entropy-Dynamic-Acceleration-Core-SEDAC}
-}
-```
+Do whatever you want to do.
 
 ## License
 
