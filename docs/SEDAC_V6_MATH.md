@@ -1,70 +1,117 @@
-# SEDAC V6.0 Mathematical Formulation & Derivations
+# SEDAC V6.0 Mathematical Formulation
 
-## 1. Low-Rank Entropy Probe (LREProbe)
+## 1. Notation & Definitions
 
-The core risk estimator is a lightweight MLP attached to the hidden states $h_l \in \mathbb{R}^{B \times S \times D}$ of layer $l$.
+| Symbol | Description | Code Variable |
+|--------|-------------|---------------|
+| $h_l$ | Hidden state at layer $l$ | `hidden_states` |
+| $D$ | Model hidden dimension | `input_dim` (e.g., 2048) |
+| $R$ | Probe rank (subspace dimension) | `rank` (default: 64) |
+| $r_l(h)$ | Predicted risk (semantic entropy) | `_risk` |
+| $\tau_l$ | Exit threshold for layer $l$ | `sedac_thresholds` |
+| $\alpha$ | Calibration smoothing factor | `sedac_calibration_alpha` |
+| $\rho$ | Target exit rate | `sedac_target_exit_rates` |
 
-$$
-r(h) = \text{Softplus}(W_2 \cdot \text{LayerNorm}(W_1 h))
-$$
+## 2. Low-Rank Entropy Probe (LREProbe)
 
-Where:
-- $W_1 \in \mathbb{R}^{D \times R}$ projects the high-dimensional hidden state to a low-rank subspace $R \ll D$ (typically $R=64$).
-- $W_2 \in \mathbb{R}^{R \times 1}$ maps the normalized features to a scalar logit.
-- $\text{Softplus}(x) = \log(1 + e^x)$ ensures non-negative risk scores.
-
-**Key Assumption**: The "uncertainty" or "difficulty" of a token is linearly separable in a low-rank subspace of the hidden states after LayerNorm.
-
-## 2. Cascade Exit Decision (Sequence-Level Latch)
-
-In SEDAC V6, we perform early exit checks at multiple checkpoints $L_{check} = \{7, 14, 21\}$.
-Unlike token-level masking (which is complex to implement safely with KV-cache), we use a **Sequence-Level Latch** mechanism.
-
-For a sequence of length $S$ at layer $l \in L_{check}$, the exit condition is:
+The probe maps a hidden state vector $x \in \mathbb{R}^D$ to a scalar risk score $r \in \mathbb{R}^+$.
+Before processing, inputs are sanitized: $x \leftarrow \text{NanToNum}(x)$.
 
 $$
-E_l = \mathbb{I}\left(\max_{t=1}^S r_l(h_{l,t}) < \tau_l\right)
+r(x) = \text{Softplus}(W_2 \cdot \text{LayerNorm}(W_1 x))
 $$
 
-If $E_l = 1$:
-- The request is marked as "exited".
-- For all subsequent layers $k > l$, the MLP block is skipped: $h_{k} = h_{k-1}$ (effectively).
-- Attention blocks are **still executed** to update the KV-cache, ensuring future tokens can attend to this position correctly.
+**Strict Implementation Details:**
+- **Projection**: $W_1 \in \mathbb{R}^{D \times R}$ (Code: `nn.Linear(input_dim, rank, bias=False)`). The linear transformation is $x W_1$.
+- **Normalization**: $\text{LayerNorm}(z) = \frac{z - \mu}{\sigma} \odot \gamma + \beta$, where $\gamma, \beta \in \mathbb{R}^R$ are learnable affine parameters.
+- **Head**: $W_2 \in \mathbb{R}^{R \times 1}$ (Code: `nn.Linear(rank, 1, bias=True)`).
+- **Activation**: $\text{Softplus}(z) = \log(1 + \exp(z))$.
 
-**Why Max?**
-Using $\max$ is a conservative safety guarantee. If *any* token in the sequence has high risk (high uncertainty), we do *not* exit, because that token might need further processing (depth) to be resolved correctly. We only exit if *all* tokens are "safe" (low risk).
+**Code Reference:** [patch_vllm_surgical.py](patch_vllm_surgical.py) `LREProbe` class
 
-## 3. Adaptive Threshold Calibration
+## 3. Training Objective
 
-To maintain a target exit rate $\rho_{target}$ (e.g., 0.5) under shifting data distributions, we adjust $\tau_l$ dynamically.
+The probes are trained to predict the **log-transformed semantic entropy** of the generation.
 
-Let $R_l = \{r_{l,1}, r_{l,2}, \dots, r_{l, N}\}$ be a buffer of observed max-risk scores at layer $l$.
-The raw target threshold $\hat{\tau}$ is the $q$-th quantile of $R_l$, where $q = \rho_{target}$.
-
-$$
-\hat{\tau}_l = \text{Quantile}(R_l, \rho_{target})
-$$
-
-### Alpha Smoothing ($\alpha$)
-
-To prevent threshold oscillation due to batch noise, we apply Exponential Moving Average (EMA) smoothing:
+### 3.1 Target Transformation
+Let $S(x)$ be the semantic entropy of the sequence given hidden state $x$. The regression target $y$ is clamped to remove outliers:
 
 $$
-\tau_{l, t+1} = (1 - \alpha) \cdot \tau_{l, t} + \alpha \cdot \hat{\tau}_{l, batch}
+y_{raw} = \log(1 + S(x))
+$$
+$$
+y = \text{Clamp}(y_{raw}, q_{0.01}, q_{0.99})
 $$
 
-Where:
-- $\alpha \in [0, 1]$ is the smoothing factor (`SEDAC_CALIBRATION_ALPHA`).
-- $\alpha \to 1$: Fast adaptation, high variance.
-- $\alpha \to 0$: Slow adaptation, stable thresholds.
-- Default $\alpha=1.0$ (instant update) for initial calibration, but lower values recommended for continuous online adaptation.
+Where $q_{0.01}, q_{0.99}$ are the 1st and 99th percentiles of the log-entropy distribution in the training batch.
 
-## 4. Complexity Analysis
+### 3.2 Loss Function
+We minimize the Huber Loss (Smooth L1) with $\beta=0.5$ to be robust against noise:
+
+$$
+\mathcal{L}(r, y) = \begin{cases}
+0.5 (r - y)^2 / \beta, & \text{if } |r - y| < \beta \\
+|r - y| - 0.5 \beta, & \text{otherwise}
+\end{cases}
+$$
+
+**Code Reference:** [train_multilayer_probes.py](train_multilayer_probes.py) `train_single_probe` function
+
+## 4. Inference Logic: Sequence-Level Latch
+
+SEDAC V6 uses a **Sequence-Level Latch** to ensure KV-cache consistency.
+
+### 4.1 Exit Condition
+At each checkpoint layer $l \in \{7, 14, 21\}$, for a sequence of tokens with hidden states $H_l = \{h_{l,1}, \dots, h_{l,S}\}$:
+
+$$
+\text{Risk}_{seq} = \max_{i=1}^S r_l(h_{l,i})
+$$
+
+The exit decision $E_l \in \{0, 1\}$ is:
+
+$$
+E_l = \mathbb{I}(\text{Risk}_{seq} < \tau_l)
+$$
+
+### 4.2 Cascade Execution Flow
+If $E_l = 1$ (Exit Triggered):
+1.  **Latch State**: Global flag `self._sedac_exited` is set to `True`.
+2.  **Forward Pass ($k > l$)**:
+    -   **Attention**: Executed normally to update KV cache.
+    -   **MLP Skip**: The MLP block is bypassed.
+        $$
+        h_{k, \text{out}} = h_{k, \text{attn}} + \mathbf{0} \quad (\text{Residual connection carries the signal})
+        $$
+    -   **LayerNorms**: Both Pre-Attn and Post-Attn LayerNorms are executed to maintain statistical stability.
+
+**Code Reference:** [patch_vllm_surgical.py](patch_vllm_surgical.py) `forward_code_v6` & `decoder_patch_v6`
+
+## 5. Adaptive Threshold Calibration
+
+When `SEDAC_ADAPTIVE=1`, thresholds $\tau_l$ are updated online.
+
+### 5.1 Quantile Estimation
+Let $\mathcal{R}_l$ be a rolling buffer of history risk scores. The raw target threshold $\hat{\tau}_l$ for a target exit rate $\rho$ is:
+
+$$
+\hat{\tau}_l = \text{Quantile}(\mathcal{R}_l, \rho)
+$$
+
+### 5.2 EMA Smoothing
+To prevent oscillation, the operating threshold is updated via Exponential Moving Average (EMA):
+
+$$
+\tau_{l}^{(t+1)} = (1 - \alpha) \cdot \tau_{l}^{(t)} + \alpha \cdot \hat{\tau}_l
+$$
+
+- $\alpha \in [0, 1]$ (`SEDAC_CALIBRATION_ALPHA`).
+- Logic ensures $\tau_l$ only updates after a calibration warmup period (`SEDAC_CALIBRATION_STEPS`).
+
+**Code Reference:** [patch_vllm_surgical.py](patch_vllm_surgical.py) (Calibration Block)
+
+## 6. Complexity Analysis
 
 - **Probe Cost**: $O(S \cdot D \cdot R)$ per checkpoint.
-- **MLP Savings**: $O(S \cdot D^2)$ per skipped layer.
-- **Break-even Condition**:
-  $$
-  N_{skipped} \cdot (S \cdot D^2) > |L_{check}| \cdot (S \cdot D \cdot R)
-  $$
-  Since $R \approx 64$ and $D \approx 2048$, $D/R \approx 32$. One skipped MLP layer pays for ~32 probe executions.
+- **MLP Savings**: $O(S \cdot D \cdot 4D)$ per skipped layer (SwiGLU gate adds params).
+- **Overhead Ratio**: Since $D \approx 32 R$, the probe is $\sim \frac{1}{128}$ the cost of an MLP block.
