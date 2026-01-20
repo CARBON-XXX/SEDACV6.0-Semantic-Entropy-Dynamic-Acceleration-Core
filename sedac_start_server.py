@@ -60,35 +60,25 @@ def main() -> int:
     ap.add_argument("--timeout-ready-s", type=float, default=600.0)
     ap.add_argument("--disable-sedac", action="store_true")
     ap.add_argument("--sedac-adaptive", action="store_true")
-    ap.add_argument("--sedac-adaptive-alpha", type=float, default=0.1)
-    ap.add_argument("--sedac-adaptive-sensitivity", type=float, default=0.5)
-    ap.add_argument("--sedac-layer", type=int, default=21)
-    ap.add_argument("--sedac-threshold", type=float, default=0.3)
-    ap.add_argument("--sedac-calibration-steps", type=int, default=20)
-    ap.add_argument("--sedac-calibration-quantile", type=float, default=0.9)
-    ap.add_argument("--sedac-log-every", type=int, default=0)
-    ap.add_argument(
-        "--sedac-latch",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Force latching (safe for KV cache)",
-    )
+    ap.add_argument("--sedac-probe-layers", type=str, default="7,14,21", help="Comma-separated probe layers")
+    ap.add_argument("--sedac-thresholds", type=str, default="0.8,1.3,1.7", help="Comma-separated thresholds")
+    ap.add_argument("--sedac-exit-rates", type=str, default="0.2,0.6,0.9", help="Target exit rates for adaptive mode")
+    ap.add_argument("--sedac-probe-dir", type=str, default="sedac_data", help="Directory containing probe files")
+    ap.add_argument("--sedac-layer", type=int, default=21, help="DEPRECATED: Use --sedac-probe-layers")
+    ap.add_argument("--sedac-threshold", type=float, default=0.3, help="DEPRECATED: Use --sedac-thresholds")
+    ap.add_argument("--sedac-calibration-steps", type=int, default=50)
+    ap.add_argument("--sedac-log-every", type=int, default=50)
+
+    
     args = ap.parse_args()
 
-    spec_arg = ""
-    spec_src = ""
-    if str(args.speculative_config_file).strip():
-        spec_src = Path(str(args.speculative_config_file)).read_text(encoding="utf-8")
-    elif str(args.speculative_config).strip():
-        spec_src = str(args.speculative_config)
-    if spec_src.strip():
-        spec_obj = json.loads(spec_src)
-        if not isinstance(spec_obj, dict):
-            raise RuntimeError("--speculative-config must be a JSON object")
-        spec_json = json.dumps(spec_obj, ensure_ascii=False).replace("'", "\\u0027")
-        spec_arg = f" --speculative-config '{spec_json}'"
+    # ... (skipping to cmd construction)
 
     sedac_val = "0" if args.disable_sedac else "1"
+    
+    # Resolve probe dir absolute path
+    probe_dir = os.path.abspath(args.sedac_probe_dir)
+    
     cmd = [
         "bash",
         "-lc",
@@ -99,17 +89,18 @@ def main() -> int:
         " && export no_proxy=localhost,127.0.0.1,0.0.0.0,::1"
         f" && export PROMETHEUS_MULTIPROC_DIR=/tmp/sedac_prom_{int(args.port)}"
         " && rm -rf \"$PROMETHEUS_MULTIPROC_DIR\" && mkdir -p \"$PROMETHEUS_MULTIPROC_DIR\""
+        
+        # V6 Env Vars
         f" && export SEDAC_ENABLED={sedac_val}"
         f" && export SEDAC_ADAPTIVE={'1' if args.sedac_adaptive else '0'}"
-        f" && export SEDAC_ADAPTIVE_ALPHA={float(args.sedac_adaptive_alpha)}"
-        f" && export SEDAC_ADAPTIVE_SENSITIVITY={float(args.sedac_adaptive_sensitivity)}"
-        f" && export SEDAC_LAYER={int(args.sedac_layer)}"
-        f" && export SEDAC_THRESHOLD={float(args.sedac_threshold)}"
-        f" && export SEDAC_CALIBRATION_STEPS={int(args.sedac_calibration_steps)}"
+        f" && export SEDAC_PROBE_LAYERS='{str(args.sedac_probe_layers)}'"
+        f" && export SEDAC_THRESHOLDS='{str(args.sedac_thresholds)}'"
+        f" && export SEDAC_EXIT_RATES='{str(args.sedac_exit_rates)}'"
         f" && export SEDAC_CALIBRATION_QUANTILE={float(args.sedac_calibration_quantile)}"
         f" && export SEDAC_LOG_EVERY={int(args.sedac_log_every)}"
         f" && export SEDAC_LATCH={'1' if args.sedac_latch else '0'}"
-        " && export SEDAC_PROBE_PATH=\"/mnt/g/SEDACV5.0 FAST/sedac_data/sedac_probe_layer21.pth\""
+        f" && export SEDAC_PROBE_DIR='{probe_dir}'"
+        
         " && python -m vllm.entrypoints.openai.api_server"
         f" --host {str(args.host)}"
         f" --port {int(args.port)}"

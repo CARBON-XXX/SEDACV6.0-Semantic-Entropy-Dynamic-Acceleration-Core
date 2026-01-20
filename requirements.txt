@@ -1,6 +1,7 @@
-vllm
-torch
-transformers
-safetensors
+torch>=2.0.0
+transformers>=4.36.0
+vllm>=0.4.0
 datasets
-
+tqdm
+prometheus-client
+safetensors

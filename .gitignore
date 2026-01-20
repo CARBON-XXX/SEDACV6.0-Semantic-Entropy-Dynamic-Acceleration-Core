@@ -21,7 +21,11 @@ sedac_data/
 
 # Logs and reports
 *.log
+!baseline_server.log
+!sedac_server.log
 sedac_reports/
+!sedac_reports/
+!sedac_reports/**
 prom_multiproc_dir/
 
 # System

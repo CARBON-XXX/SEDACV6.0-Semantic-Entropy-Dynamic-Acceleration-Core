@@ -1,0 +1,22 @@
+name: Question
+description: Ask a question about usage or results
+title: "[Question]: "
+labels: ["question"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: Ask your question and include relevant context.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Model/config/log paths if applicable.
+      placeholder: configs/... , artifacts/logs/... , artifacts/reports/...
+    validations:
+      required: false
+

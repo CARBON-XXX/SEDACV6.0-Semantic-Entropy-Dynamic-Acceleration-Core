@@ -1,3 +1,32 @@
+"""
+SEDAC V6.0 - Semantic Entropy Dynamic Acceleration Core
+========================================================
+
+Multi-layer Cascade Early Exit for vLLM (Qwen2 Architecture)
+
+This module patches vLLM's Qwen2 model to enable dynamic early exit
+based on semantic entropy prediction at multiple checkpoint layers.
+
+Architecture:
+    - LREProbe: Low-Rank Entropy probe for risk prediction
+    - Cascade Exit: Token-level early exit across layers 7, 14, 21
+    - Adaptive Threshold: Runtime calibration based on target exit rates
+
+Environment Variables:
+    SEDAC_ENABLED         : Enable/disable SEDAC (0/1)
+    SEDAC_PROBE_LAYERS    : Comma-separated checkpoint layers (default: 7,14,21)
+    SEDAC_THRESHOLDS      : Initial thresholds per layer (default: 0.8,1.3,1.7)
+    SEDAC_ADAPTIVE        : Enable adaptive threshold calibration (0/1)
+    SEDAC_EXIT_RATES      : Target exit rates for calibration (default: 0.2,0.6,0.9)
+    SEDAC_PROBE_DIR       : Directory containing trained probe weights
+    SEDAC_PROBE_RANK      : Probe hidden dimension (default: 64)
+
+Reference:
+    SEDAC: Semantic Entropy Dynamic Acceleration Core
+    https://github.com/CARBON-XXX/Semantic-Entropy-Dynamic-Acceleration-Core-SEDAC
+
+License: MIT
+"""
 
 import argparse
 import os
@@ -5,23 +34,40 @@ import sys
 
 
 def _resolve_target_path(arg_target_path: str | None) -> str:
+    """Resolve vLLM Qwen2 model source path for patching."""
     if arg_target_path:
         return arg_target_path
     env_target = os.environ.get("SEDAC_VLLM_QWEN2_PATH")
     if env_target:
         return env_target
     try:
-        import vllm.model_executor.models.qwen2 as qwen2  # type: ignore[import-not-found]
-
+        import vllm.model_executor.models.qwen2 as qwen2
         return str(qwen2.__file__)
     except Exception:
-        return "/home/ason/miniconda3/envs/sedac_dev/lib/python3.10/site-packages/vllm/model_executor/models/qwen2.py"
+        return ""
 
-# Define the code snippets to insert
+
+# =============================================================================
+# LREProbe Definition - Low-Rank Entropy Predictor
+# =============================================================================
 probe_def = """
-SEDAC_PATCH_VERSION = 5
+import os
+import torch
+SEDAC_PATCH_VERSION = 6
 
 class LREProbe(nn.Module):
+    \"\"\"
+    Low-Rank Entropy Probe for semantic uncertainty prediction.
+    
+    Architecture: Linear(d -> r) -> LayerNorm -> Linear(r -> 1) -> Softplus
+    
+    Args:
+        input_dim: Model hidden dimension (e.g., 2048 for Qwen2.5-3B)
+        rank: Probe hidden dimension (default: 64)
+    
+    Returns:
+        Predicted risk score (non-negative, lower = more confident)
+    \"\"\"
     def __init__(self, input_dim, rank=64):
         super().__init__()
         self.proj = nn.Linear(input_dim, rank, bias=False)
@@ -35,194 +81,229 @@ class LREProbe(nn.Module):
         return self.act(self.head(h))
 """
 
-init_code = """
+init_code_v6 = """
         import os
+        import torch
         from vllm.logger import init_logger
 
-        self._sedac_patch_begin = 5
+        self._sedac_patch_begin = 6
         self._sedac_logger = init_logger("vllm.sedac")
+        self._sedac_calls_metric = None
+        self._sedac_exits_metric = None
+        try:
+            from prometheus_client import Counter
+            _cls = type(self)
+            if not hasattr(_cls, "_sedac_calls_metric"):
+                _cls._sedac_calls_metric = Counter("sedac_calls_total", "SEDAC decisions evaluated")
+                _cls._sedac_exits_metric = Counter("sedac_exits_total", "SEDAC exits triggered")
+            self._sedac_calls_metric = getattr(_cls, "_sedac_calls_metric", None)
+            self._sedac_exits_metric = getattr(_cls, "_sedac_exits_metric", None)
+        except Exception:
+            pass
+        
         _sedac_enabled_env = os.environ.get("SEDAC_ENABLED", "0")
         self.sedac_enabled = _sedac_enabled_env.lower() in ("1", "true", "yes")
-        self.sedac_mode = os.environ.get("SEDAC_MODE", "early_exit")
-        self.sedac_layer = int(os.environ.get("SEDAC_LAYER", "21"))
-        self.sedac_probe = None
-        self.sedac_threshold = float(os.environ.get("SEDAC_THRESHOLD", "0.3"))
-        self.sedac_adaptive = os.environ.get("SEDAC_ADAPTIVE", "0").lower() in ("1", "true", "yes")
-        self.sedac_adaptive_alpha = float(os.environ.get("SEDAC_ADAPTIVE_ALPHA", "0.1"))
-        self.sedac_adaptive_sensitivity = float(os.environ.get("SEDAC_ADAPTIVE_SENSITIVITY", "0.5"))
-        self.sedac_avg_entropy = 0.0
-        self.sedac_calibration_steps = int(os.environ.get("SEDAC_CALIBRATION_STEPS", "20"))
-        try:
-            _q = float(os.environ.get("SEDAC_CALIBRATION_QUANTILE", "0.9"))
-        except Exception:
-            _q = 0.9
-        if _q < 0.0:
-            _q = 0.0
-        if _q > 1.0:
-            _q = 1.0
-        self.sedac_calibration_quantile = _q
+        
+        # V6: Multi-layer configuration
+        _probe_layers_str = os.environ.get("SEDAC_PROBE_LAYERS", "7,14,21")
+        self.sedac_probe_layers = tuple(int(x.strip()) for x in _probe_layers_str.split(",") if x.strip())
+        
+        # Adaptive threshold mode
+        self.sedac_adaptive = os.environ.get("SEDAC_ADAPTIVE", "1").lower() in ("1", "true", "yes")
         self.sedac_calibrated = False
-        self.sedac_entropy_history = []
-        # Latch disabled by default for safety
-        self.sedac_latch = False 
-        self._sedac_latched_exit = None
+        self.sedac_calibration_steps = int(os.environ.get("SEDAC_CALIBRATION_STEPS", "50"))
+        self.sedac_risk_history = {l: [] for l in self.sedac_probe_layers}
+        
+        # Target exit rates (adaptive mode)
+        _exit_rates_str = os.environ.get("SEDAC_EXIT_RATES", "0.2,0.6,0.9")
+        _exit_rates_list = [float(x.strip()) for x in _exit_rates_str.split(",") if x.strip()]
+        while len(_exit_rates_list) < len(self.sedac_probe_layers):
+            _exit_rates_list.append(0.9)
+        self.sedac_target_exit_rates = dict(zip(self.sedac_probe_layers, _exit_rates_list))
+        
+        # Initial thresholds (static mode or pre-calibration)
+        _thresholds_str = os.environ.get("SEDAC_THRESHOLDS", "0.8,1.3,1.7")
+        _thresholds_list = [float(x.strip()) for x in _thresholds_str.split(",") if x.strip()]
+        while len(_thresholds_list) < len(self.sedac_probe_layers):
+            _thresholds_list.append(_thresholds_list[-1] if _thresholds_list else 1.0)
+        self.sedac_thresholds = dict(zip(self.sedac_probe_layers, _thresholds_list))
+        
+        self.__dict__["sedac_probes"] = {}
+        self.sedac_threshold_tensors = {}
         self.sedac_log_every = int(os.environ.get("SEDAC_LOG_EVERY", "50"))
         self.sedac_calls = 0
-        self.sedac_exit_calls = 0
-        _probe_path_default = "/mnt/g/SEDACV5.0 FAST/sedac_data/sedac_probe_layer21.pth"
-        _probe_path = os.environ.get("SEDAC_PROBE_PATH", _probe_path_default)
+        self.sedac_exit_calls = {}
+        self._sedac_exited = False
+        
+        # Support Windows and Linux paths
+        _probe_dir = os.environ.get("SEDAC_PROBE_DIR", "")
+        if not _probe_dir:
+            for _try_dir in ["/mnt/g/SEDACV5.0 FAST/sedac_data", "G:/SEDACV5.0 FAST/sedac_data", "./sedac_data"]:
+                if os.path.isdir(_try_dir):
+                    _probe_dir = _try_dir
+                    break
+            else:
+                _probe_dir = "./sedac_data"
+        
         self._sedac_logger.warning(
-            "SEDAC patch v%d active enabled=%s env=%s mode=%s layer=%d threshold=%.6f probe_path=%s",
-            5,
-            self.sedac_enabled,
-            _sedac_enabled_env,
-            self.sedac_mode,
-            self.sedac_layer,
-            self.sedac_threshold,
-            _probe_path,
+            "SEDAC patch v6 (cascade) enabled=%s layers=%s thresholds=%s probe_dir=%s",
+            self.sedac_enabled, self.sedac_probe_layers, self.sedac_thresholds, _probe_dir,
         )
 
         if self.sedac_enabled:
             try:
-                probe_path = _probe_path
+                _dev = "cuda" if torch.cuda.is_available() else "cpu"
+                _dtype = config.dtype if hasattr(config, "dtype") else torch.float16
                 probe_rank = int(os.environ.get("SEDAC_PROBE_RANK", "64"))
                 pp_group = get_pp_group()
                 _pp_ws = getattr(pp_group, "world_size", 1)
                 pp_world_size = int(_pp_ws() if callable(_pp_ws) else _pp_ws)
+                
                 if pp_world_size != 1:
                     self.sedac_enabled = False
-                    self._sedac_logger.warning("SEDAC disabled: pipeline_parallel_world_size=%d", pp_world_size)
-                elif not os.path.exists(probe_path):
-                    self.sedac_enabled = False
-                    self._sedac_logger.warning("SEDAC probe missing path=%s; disabled", probe_path)
+                    self._sedac_logger.warning("SEDAC disabled: pp_world_size=%d", pp_world_size)
                 else:
-                    probe = LREProbe(config.hidden_size, rank=probe_rank)
-                    state_dict = torch.load(probe_path, map_location="cpu")
-                    probe.load_state_dict(state_dict, strict=True)
-                    probe.eval()
-                    if torch.cuda.is_available():
-                        probe = probe.to("cuda")
-                    self.sedac_probe = probe
-                    self._sedac_logger.warning(
-                        "SEDAC probe loaded path=%s layer=%d threshold=%.6f mode=%s",
-                        probe_path,
-                        self.sedac_layer,
-                        self.sedac_threshold,
-                        self.sedac_mode,
-                    )
+                    _loaded_any = False
+                    for _layer_idx in self.sedac_probe_layers:
+                        _probe_path = os.path.join(_probe_dir, f"sedac_probe_layer{_layer_idx}.pth")
+                        if not os.path.exists(_probe_path):
+                            self._sedac_logger.warning("SEDAC probe missing for layer %d: %s", _layer_idx, _probe_path)
+                            continue
+                        
+                        _probe = LREProbe(config.hidden_size, rank=probe_rank)
+                        _probe.load_state_dict(torch.load(_probe_path, map_location="cpu"), strict=True)
+                        _probe.to(device=_dev, dtype=_dtype).eval()
+                        for _p in _probe.parameters():
+                            _p.requires_grad_(False)
+                        
+                        self.__dict__["sedac_probes"][_layer_idx] = _probe
+                        self.sedac_threshold_tensors[_layer_idx] = torch.tensor(
+                            self.sedac_thresholds[_layer_idx], device=_dev, dtype=_dtype
+                        )
+                        self.sedac_exit_calls[_layer_idx] = 0
+                        self._sedac_logger.warning("SEDAC probe loaded: layer=%d threshold=%.4f", _layer_idx, self.sedac_thresholds[_layer_idx])
+                        _loaded_any = True
+                    
+                    if not _loaded_any:
+                        self.sedac_enabled = False
+                        self._sedac_logger.warning("SEDAC disabled: no probes loaded")
+                    else:
+                        self._sedac_logger.warning("SEDAC ready: %d probes loaded", len(self.__dict__["sedac_probes"]))
             except Exception:
                 self.sedac_enabled = False
-                self._sedac_logger.exception("SEDAC probe load failed path=%s", os.environ.get("SEDAC_PROBE_PATH", ""))
-
-        self._sedac_patch_end = 5
+                self._sedac_logger.exception("SEDAC probe load failed")
+        self._sedac_patch_end = 6
 """
 
-forward_code = """
-            _sedac_patch_forward_begin = 5
-            if getattr(self, "sedac_enabled", False) and self.sedac_probe is not None and self.sedac_mode == "early_exit":
-                abs_layer = idx + self.start_layer
-                if abs_layer == self.sedac_layer:
-                    with torch.no_grad():
-                        # Latch logic REMOVED for PPL safety. 
-                        # We always compute probe to ensure dynamic safety per batch.
-                        
-                        curr_res = residual if residual is not None else 0
-                        current_h = hidden_states + curr_res
-                        target_dtype = self.sedac_probe.proj.weight.dtype
-                        if current_h.dtype != target_dtype:
-                            current_h = current_h.to(target_dtype)
-                        
-                        predicted_entropy = self.sedac_probe(current_h)
-                        # Use MAX entropy for safety (if any token is unsure, don't exit)
-                        batch_entropy_metric = float(predicted_entropy.max().item())
+forward_code_v6 = """
+            _sedac_patch_forward_begin = 6
+            if self.sedac_enabled:
+                _probes = self.__dict__.get("sedac_probes", {})
+                _abs_layer = idx + self.start_layer
+                
+                # Reset state at first layer
+                if idx == 0:
+                    self._sedac_exited = False
+                    for _layer in self.layers:
+                        _layer._sedac_skip_mlp = False
+                
+                # If already exited, skip subsequent checks
+                if not self._sedac_exited and _abs_layer in _probes:
+                    _probe = _probes[_abs_layer]
+                    
+                    with torch.inference_mode():
+                        current_h = hidden_states + residual if residual is not None else hidden_states
+                        _risk = _probe(current_h)
+                        _max_risk = _risk.max()
                         
                         self.sedac_calls += 1
-                        current_threshold = self.sedac_threshold
-
-                        if getattr(self, "sedac_adaptive", False):
-                            if not self.sedac_calibrated:
-                                self.sedac_entropy_history.append(batch_entropy_metric)
-                                if len(self.sedac_entropy_history) >= self.sedac_calibration_steps:
-                                    sorted_ent = sorted(self.sedac_entropy_history)
-                                    q_idx = int(len(sorted_ent) * float(getattr(self, "sedac_calibration_quantile", 0.9)))
-                                    if q_idx < 0:
-                                        q_idx = 0
-                                    if q_idx >= len(sorted_ent):
-                                        q_idx = len(sorted_ent) - 1
-                                    self.sedac_threshold = sorted_ent[q_idx]
-                                    self.sedac_avg_entropy = sum(sorted_ent) / len(sorted_ent)
-                                    self.sedac_calibrated = True
-                                    self._sedac_logger.warning(
-                                        "SEDAC calibration done threshold=%.6f samples=%d",
-                                        self.sedac_threshold,
-                                        len(self.sedac_entropy_history),
-                                    )
-                                exit_now = False
-                            else:
-                                # Update moving average
-                                self.sedac_avg_entropy = (1.0 - self.sedac_adaptive_alpha) * self.sedac_avg_entropy + self.sedac_adaptive_alpha * batch_entropy_metric
-                                delta = (self.sedac_avg_entropy - batch_entropy_metric) * self.sedac_adaptive_sensitivity
-                                current_threshold = self.sedac_threshold + delta
-                                if current_threshold < 0.0:
-                                    current_threshold = 0.0
-                                exit_now = bool(batch_entropy_metric < current_threshold)
-                        else:
-                            exit_now = bool(batch_entropy_metric < current_threshold)
-
-                        if exit_now:
-                            self.sedac_exit_calls += 1
-                            # SKIP MLP for remaining layers
-                            for next_layer in self.layers[idx+1:]:
-                                next_layer.sedac_skip_mlp = True
-
-                        if exit_now or (self.sedac_log_every > 0 and (self.sedac_calls % self.sedac_log_every) == 0):
-                            self._sedac_logger.warning(
-                                "SEDAC decision abs_layer=%d max_entropy=%.6f threshold=%.6f base=%.6f exit=%s exits=%d calls=%d",
-                                abs_layer,
-                                batch_entropy_metric,
-                                current_threshold,
-                                self.sedac_threshold,
-                                exit_now,
-                                self.sedac_exit_calls,
-                                self.sedac_calls,
+                        if self._sedac_calls_metric is not None:
+                            try:
+                                self._sedac_calls_metric.inc()
+                            except Exception:
+                                pass
+                        
+                        # Adaptive threshold calibration
+                        if self.sedac_adaptive and not self.sedac_calibrated:
+                            _risk_val = _max_risk.item()
+                            self.sedac_risk_history[_abs_layer].append(_risk_val)
+                            
+                            # Check if all layers have collected enough samples
+                            _all_ready = all(
+                                len(self.sedac_risk_history.get(l, [])) >= self.sedac_calibration_steps
+                                for l in self.sedac_probe_layers
                             )
-            _sedac_patch_forward_end = 5
+                            if _all_ready:
+                                # Calculate threshold based on target exit rate
+                                for _l in self.sedac_probe_layers:
+                                    _hist = sorted(self.sedac_risk_history[_l])
+                                    _target_rate = self.sedac_target_exit_rates[_l]
+                                    _q_idx = int(len(_hist) * _target_rate)
+                                    _q_idx = min(max(0, _q_idx), len(_hist) - 1)
+                                    _new_thr = _hist[_q_idx]
+                                    self.sedac_thresholds[_l] = _new_thr
+                                    self.sedac_threshold_tensors[_l].fill_(_new_thr)
+                                self.sedac_calibrated = True
+                                self._sedac_logger.warning("SEDAC calibration done: thresholds=%s", self.sedac_thresholds)
+                            _can_exit = False  # Do not exit during calibration
+                        else:
+                            # Normal exit decision
+                            _threshold = self.sedac_threshold_tensors[_abs_layer]
+                            _can_exit = _max_risk < _threshold
+                        
+                        if _can_exit:
+                            self._sedac_exited = True
+                            self.sedac_exit_calls[_abs_layer] = self.sedac_exit_calls.get(_abs_layer, 0) + 1
+                            if self._sedac_exits_metric is not None:
+                                try:
+                                    self._sedac_exits_metric.inc()
+                                except Exception:
+                                    pass
+                            # Mark subsequent layers to skip MLP
+                            for _li, _layer in enumerate(self.layers):
+                                if _li > idx:
+                                    _layer._sedac_skip_mlp = True
+                        
+                        if self.sedac_log_every > 0 and (self.sedac_calls % self.sedac_log_every) == 0:
+                            self._sedac_logger.warning(
+                                "SEDAC L%d risk=%.4f thr=%.4f exit=%s calls=%d exits=%s cal=%s",
+                                _abs_layer, _max_risk.item(), self.sedac_thresholds[_abs_layer],
+                                bool(_can_exit), self.sedac_calls, self.sedac_exit_calls, self.sedac_calibrated,
+                            )
+            _sedac_patch_forward_end = 6
 """
 
-decoder_patch = """
-# --- SEDAC DECODER PATCH ---
+decoder_patch_v6 = """
+# --- SEDAC DECODER PATCH v6 ---
+_sedac_original_decoder_forward = Qwen2DecoderLayer.forward
+
 def _sedac_decoder_forward(
     self,
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     residual: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # Self Attention
-    if residual is None:
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-    else:
-        hidden_states, residual = self.input_layernorm(hidden_states, residual)
-    hidden_states = self.self_attn(
-        positions=positions,
-        hidden_states=hidden_states,
-    )
-
-    # Fully Connected
-    hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+    _skip_mlp = getattr(self, "_sedac_skip_mlp", False)
     
-    # SEDAC: Skip MLP if flag is set
-    if getattr(self, "sedac_skip_mlp", False):
-        hidden_states.zero_()
-        self.sedac_skip_mlp = False # Auto-reset
-    else:
-        hidden_states = self.mlp(hidden_states)
-        
-    return hidden_states, residual
+    if _skip_mlp:
+        # SEDAC: Only run attention + layernorm, skip MLP
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # Zero out MLP output
+        hidden_states = hidden_states.new_zeros(hidden_states.shape)
+        return hidden_states, residual
+    
+    return _sedac_original_decoder_forward(self, positions, hidden_states, residual)
 
 Qwen2DecoderLayer.forward = _sedac_decoder_forward
 # ---------------------------
 """
+
 
 def _strip_sedac_blocks(lines: list[str]) -> list[str]:
     out = []
@@ -253,7 +334,7 @@ def _strip_sedac_blocks(lines: list[str]) -> list[str]:
                 i += 1
             continue
 
-        if stripped == "# --- SEDAC DECODER PATCH ---":
+        if stripped in ("# --- SEDAC DECODER PATCH ---", "# --- SEDAC DECODER PATCH v2 ---", "# --- SEDAC DECODER PATCH v6 ---"):
              i += 1
              while i < len(lines):
                  if lines[i].strip() == "# ---------------------------":
@@ -261,6 +342,10 @@ def _strip_sedac_blocks(lines: list[str]) -> list[str]:
                      break
                  i += 1
              continue
+        
+        if stripped.startswith("_sedac_original_decoder_forward ="):
+            i += 1
+            continue
 
         if stripped.startswith("Qwen2DecoderLayer.forward = _sedac_decoder_forward"):
             i += 1
@@ -272,16 +357,19 @@ def _strip_sedac_blocks(lines: list[str]) -> list[str]:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="SEDAC V6 vLLM Patcher")
     parser.add_argument("--target", type=str, default=None)
+    parser.add_argument("--dry-run", action="store_true", help="Print patch without applying")
     args = parser.parse_args()
 
     target_path = _resolve_target_path(args.target)
-    print(f"Patching target: {target_path}")
+    print(f"SEDAC V6 Patcher")
+    print(f"Target: {target_path}")
 
     with open(target_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
 
+    # 清理旧 patch
     lines = _strip_sedac_blocks(lines)
 
     new_lines: list[str] = []
@@ -294,32 +382,42 @@ if __name__ == "__main__":
         
         # Insert Probe Definition BEFORE Qwen2MLP class definition
         if not inserted_probe and "class Qwen2MLP(nn.Module):" in line:
-             new_lines.pop() # Remove the line we just appended
+             new_lines.pop()
              new_lines.append(probe_def)
-             new_lines.append(line) # Add it back
+             new_lines.append(line)
              inserted_probe = True
              
         # Insert Init Code
         if not inserted_init and "self.aux_hidden_state_layers = tuple[int, ...]()" in line:
-            new_lines.append(init_code)
+            new_lines.append(init_code_v6)
             inserted_init = True
             
         # Insert Forward Code (AFTER the layer execution line)
         if not inserted_forward and "hidden_states, residual = layer(positions, hidden_states, residual)" in line:
-            new_lines.append(forward_code)
+            new_lines.append(forward_code_v6)
             inserted_forward = True
 
     # Append Decoder Patch at the end
-    new_lines.append(decoder_patch)
+    new_lines.append(decoder_patch_v6)
 
     # Safety check
     if not (inserted_probe and inserted_init and inserted_forward):
         print("Error: Could not find all insertion points.")
-        print(f"Probe: {inserted_probe}, Init: {inserted_init}, Forward: {inserted_forward}")
+        print(f"  Probe: {inserted_probe}")
+        print(f"  Init: {inserted_init}")
+        print(f"  Forward: {inserted_forward}")
         sys.exit(1)
 
-    # Write back
-    with open(target_path, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
-
-    print("Successfully patched qwen2.py")
+    if args.dry_run:
+        print("\n--- DRY RUN: Patch content ---")
+        print("".join(new_lines[-100:]))
+        print("--- End ---")
+    else:
+        with open(target_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        print("✅ Successfully patched with SEDAC V6!")
+        print("\nUsage:")
+        print("  export SEDAC_ENABLED=1")
+        print("  export SEDAC_PROBE_LAYERS=7,14,21")
+        print("  export SEDAC_THRESHOLDS=0.15,0.25,0.40")
+        print("  export SEDAC_PROBE_DIR=/path/to/sedac_data")

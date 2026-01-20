@@ -1,0 +1,47 @@
+name: Bug report
+description: Report a reproducible bug
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect to happen, and what actually happened?
+      placeholder: Include the exact error message and where it occurs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Provide minimal steps to reproduce the issue.
+      placeholder: Commands, config paths, and environment variables.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Provide system details.
+      value: |
+        - OS:
+        - GPU / VRAM:
+        - Driver / CUDA:
+        - Python:
+        - vLLM:
+        - Model:
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and artifacts
+      description: Attach full logs and the report JSON.
+      placeholder: artifacts/logs/... , artifacts/reports/...
+    validations:
+      required: true
+
